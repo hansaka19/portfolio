@@ -55,7 +55,7 @@
      iOS Safari makes the hero taller than the visible area, which pushed the
      copy and the scroll hint underneath the toolbar. */
   #hero-space { height: 100vh; height: 100svh; }
-  #dissolve-space { height: 130vh; height: 130svh; }
+  #dissolve-space { height: 0; }
 
   /* ---------------- nav ---------------- */
   .nav {
@@ -113,15 +113,33 @@
     .nav .mark { font-size: 17px; }
     .nav .cta { padding: 9px 16px; font-size: 13px; }
 
+    /* He is framed into the top band by layoutScene(); this veil fades the
+       paper up over his lower half so the copy always sits on clean
+       background instead of across his face. */
+    .hero-copy::before {
+      content: ""; position: fixed; left: 0; right: 0; bottom: 0;
+      height: 58vh; height: 58svh; z-index: -1; pointer-events: none;
+      background: linear-gradient(180deg,
+        rgba(255,255,255,0) 0%,
+        rgba(255,255,255,0.70) 18%,
+        rgba(251,251,250,0.95) 38%,
+        #fbfbfa 56%);
+    }
+    #stage { opacity: 0.62; }
+
+    /* The Toolkit starts immediately after the first screen. */
+
     /* Sized against BOTH width and the small-viewport height, so a 667px SE
        gets a smaller hero than an 812px mini — continuously, with no height
        breakpoint that would make the type jump when iOS hides its toolbar. */
     /* first value = fallback for browsers without svh (iOS < 15.4) */
     .hero-copy .eyebrow { margin-bottom: 16px; margin-bottom: min(20px, 2.6svh); }
+    /* 7.2vw keeps "Design and development" on one line inside the 90vw
+       column, so the title stays two lines the way it is on desktop */
     .hero-copy h1 {
-      font-size: clamp(22px, 7.6vw, 32px);
-      font-size: min(clamp(22px, 7.6vw, 32px), 4.6svh);
-      line-height: 1.08; margin-bottom: 12px; margin-bottom: min(14px, 1.9svh);
+      font-size: clamp(21px, 7.2vw, 30px);
+      font-size: min(clamp(21px, 7.2vw, 30px), 4.4svh);
+      line-height: 1.1; margin-bottom: 12px; margin-bottom: min(14px, 1.9svh);
     }
     .hero-copy p  { font-size: 14px; font-size: min(14px, 2.2svh); line-height: 1.55; }
     .hero-actions { margin-top: 18px; margin-top: min(22px, 3.2svh); flex-wrap: wrap; gap: 8px; }
@@ -588,6 +606,7 @@
     const heroCopyEl = document.querySelector(".hero-copy");
     const scrollHintEl = document.querySelector(".scroll-hint");
     const dissolveSpaceEl = document.getElementById("dissolve-space");
+    const heroSpaceEl = document.getElementById("hero-space");
 
     const PAPER = 0xf7f7f6;
 
@@ -921,8 +940,29 @@
       const { w, h } = stageSize();
       const aspect = w / h;
       const portrait = aspect < 1.0;
-      const dist = portrait ? 4.7 : THREE.MathUtils.lerp(4.15, 3.5, Math.min(1, (aspect - 1) / 0.9));
-      const lookY = portrait ? 0.66 : 0.72;
+      const tanHalf = Math.tan(THREE.MathUtils.degToRad(camera.fov * 0.5));
+
+      let dist, lookY;
+
+      if (isPhone() && portrait) {
+        // Phone portrait: the copy owns the bottom of the screen, so frame him
+        // into a band across the top instead of letting him fill the viewport
+        // and sit underneath the text.
+        //   worldY(f) = lookY + visibleH * (0.5 - f)     f = fraction from top
+        //   want worldY(TOP) = height and worldY(BOTTOM) = 0
+        const H = (modelRoot && modelRoot.userData.height) || 1.75;
+        const TOP = 0.12, BOTTOM = 0.60;   // clear of the nav, above the copy
+        const visibleH = H / (BOTTOM - TOP);
+        dist = visibleH / (2 * tanHalf);
+        lookY = visibleH * (BOTTOM - 0.5);
+        // FogExp2 is distance-squared, so pulling the camera back this far
+        // would wash him out — thin the fog to keep the same apparent haze.
+        if (scene.fog) scene.fog.density = 0.07 * (4.7 / dist);
+      } else {
+        dist = portrait ? 4.7 : THREE.MathUtils.lerp(4.15, 3.5, Math.min(1, (aspect - 1) / 0.9));
+        lookY = portrait ? 0.66 : 0.72;
+        if (scene.fog) scene.fog.density = 0.07;
+      }
 
       camera.position.set(0.02, lookY + 0.16, dist);
       camera.lookAt(0, lookY, 0);
@@ -949,13 +989,19 @@
       const root = gltf.scene;
       modelRoot = root;
 
-      const box = new THREE.Box3().setFromObject(root);
+      // Skinning needs current bone matrices before measuring the visible mesh.
+      root.updateMatrixWorld(true);
+      root.traverse((n) => { if (n.isSkinnedMesh) n.skeleton.update(); });
+      const box = new THREE.Box3().setFromObject(root, true);
       const c = new THREE.Vector3();
       box.getCenter(c);
       root.position.x -= c.x;
       root.position.z -= c.z;
       root.position.y -= box.min.y;
       root.userData.baseX = root.position.x;
+      // real height, so the phone framing below can place him in an exact
+      // band of the screen instead of guessing
+      root.userData.height = Math.max(0.01, box.max.y - box.min.y);
       scene.add(root);
       layoutScene();
 
@@ -1220,12 +1266,18 @@
     let introTime = 0;
     const easeOutCubic = (t) => 1 - Math.pow(1 - t, 3);
 
+    // Was measured off the dissolve spacer, which only starts moving once a
+    // whole screen has been scrolled — so nothing happened for the first
+    // swipe. Measure from the very first pixel instead and finish just before
+    // the dark band arrives, so he reacts immediately and is gone on cue.
     function scrollProgress() {
-      const r = dissolveSpaceEl.getBoundingClientRect();
-      if (r.height <= 0) return 0;
-      return Math.min(1, Math.max(0, -r.top / r.height));
+      const end = (heroSpaceEl.offsetHeight + dissolveSpaceEl.offsetHeight) * 0.92;
+      if (end <= 0) return 0;
+      return Math.min(1, Math.max(0, window.scrollY / end));
     }
 
+    const SCROLL_RESPONSE = 12;
+    let smoothedScroll = 0;
     let assembly = 0;
     function updatePhase(dt) {
       if (!ready || !assemblyMat) return;
@@ -1235,7 +1287,12 @@
       const intro = easeOutCubic(introRaw);
       if (introRaw >= 1) releaseScroll();
 
-      assembly = scrollReleased ? Math.min(intro, 1 - scrollProgress()) : intro;
+      // Time-based damping absorbs wheel/trackpad jumps in either direction.
+      // Keep the intro independent so its timing remains unchanged.
+      const targetScroll = scrollReleased ? scrollProgress() : 0;
+      smoothedScroll += (targetScroll - smoothedScroll) * -Math.expm1(-SCROLL_RESPONSE * dt);
+      if (Math.abs(targetScroll - smoothedScroll) < 0.0001) smoothedScroll = targetScroll;
+      assembly = scrollReleased ? Math.min(intro, 1 - smoothedScroll) : intro;
 
       assemblyMat.uniforms.uAssembly.value = assembly;
       if (charMesh) charMesh.visible = assembly > 0.955;
@@ -1308,7 +1365,12 @@
        7. loop, resize, adaptive quality
        ========================================================= */
     function syncScale() {
-      const s = pointScale();
+      // The phone framing pulls the camera back ~2x. Point size divides by
+      // view depth, so without this the dust would halve and most of it would
+      // hit the 1.5px floor — the assembly went sparse and grey. Boost by the
+      // same factor to keep the grain identical on screen.
+      const boost = Math.max(1, camera.position.z / 4.7);
+      const s = pointScale() * boost;
       mist.mat.uniforms.uScale.value = s;
       if (assemblyMat) assemblyMat.uniforms.uScale.value = s;
     }
@@ -1358,7 +1420,7 @@
     const navEl = document.querySelector(".nav");
     let heroVisible = true;
     function onScroll() {
-      const end = document.getElementById("hero-space").offsetHeight + dissolveSpaceEl.offsetHeight;
+      const end = heroSpaceEl.offsetHeight + dissolveSpaceEl.offsetHeight;
       heroVisible = window.scrollY < end + 80;
       navEl.classList.toggle("solid", window.scrollY > window.innerHeight * 0.6);
     }
@@ -1386,6 +1448,8 @@
     function animate() {
       requestAnimationFrame(animate);
       const dt = Math.min(clock.getDelta(), 0.05);
+      // Keep progress current off screen so returning to the hero cannot jump.
+      updatePhase(dt);
       if (!heroVisible) return;
 
       const t = clock.elapsedTime;
@@ -1393,7 +1457,6 @@
       if (assemblyMat) assemblyMat.uniforms.uTime.value = t;
 
       if (mixer) mixer.update(dt);
-      updatePhase(dt);
       updateGaze(dt);
       updateCarousel(dt);
 
